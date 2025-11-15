@@ -44,8 +44,7 @@ CORS(app, origins=[
     "http://127.0.0.1:3000", 
     "http://localhost:5000",
     "http://127.0.0.1:5000",
-    "https://localhost",
-    "https://confidingly-charming-angelfish.cloudpub.ru"
+    "https://localhost"
 ])
 
 socketio = SocketIO(app, 
@@ -54,8 +53,7 @@ socketio = SocketIO(app,
         "http://127.0.0.1:3000",
         "http://localhost:5000",
         "http://127.0.0.1:5000",
-        "https://localhost",
-        "https://confidingly-charming-angelfish.cloudpub.ru"
+        "https://localhost"
     ],
     ping_timeout=30,
     ping_interval=15,
@@ -689,7 +687,7 @@ def get_profile():
     finally:
         return_db_connection(conn)
 
-# ========== УЛУЧШЕННЫЕ КОМНАТЫ И СООБЩЕНИЯ ==========
+# ========== КОМНАТЫ И СООБЩЕНИЯ ==========
 
 @app.route('/chat/rooms', methods=['GET'])
 @require_auth
@@ -1416,11 +1414,11 @@ if __name__ == '__main__':
     print("  ✅ System messages")
     print("=" * 60)
     
-    # Получаем порт из переменной окружения (для Render) или используем 5000 по умолчанию
+    
     port = int(os.environ.get('PORT', 5000))
     print(f"Starting server on port {port}")
     
-    # SSL конфигурация (не нужно для Render - они сами обрабатывают HTTPS)
+   
     ssl_context = None
     
     # Запуск сервера
@@ -1428,7 +1426,7 @@ if __name__ == '__main__':
         socketio.run(
             app, 
             host='0.0.0.0', 
-            port=port,                    # ← ИСПОЛЬЗУЕМ ПЕРЕМЕННУЮ port
+            port=port,                
             debug=False,
             ssl_context=ssl_context,
             allow_unsafe_werkzeug=False
@@ -1446,4 +1444,5 @@ if __name__ == '__main__':
                 conn.close()
             except queue.Empty:
                 break
+
         print("Server shutdown complete")
