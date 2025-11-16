@@ -1,6 +1,5 @@
-# optimized_text_messenger.py
+# optimized_text_messenger_http.py
 from flask import Flask, request, jsonify, g
-from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_cors import CORS
@@ -40,25 +39,9 @@ CORS(app, origins=[
     "http://127.0.0.1:3000", 
     "http://localhost:5000",
     "http://127.0.0.1:5000",
-    "https://localhost"
+    "https://localhost",
+    "https://confidingly-charming-angelfish.cloudpub.ru"
 ])
-
-socketio = SocketIO(app, 
-    cors_allowed_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5000",
-        "http://127.0.0.1:5000",
-        "https://localhost"
-    ],
-    ping_timeout=30,
-    ping_interval=15,
-    logger=False,
-    engineio_logger=False,
-    async_mode='threading',
-    max_http_buffer_size=1e8,
-    cors_credentials=True
-)
 
 # ========== ОПТИМИЗИРОВАННЫЕ ХРАНИЛИЩА ==========
 
@@ -90,63 +73,25 @@ class RateLimiter:
 
 class ConnectionManager:
     def __init__(self):
-        self.connections = defaultdict(int)
+        self.active_sessions = defaultdict(int)
         self._lock = threading.RLock()
     
-    def increment(self, ip):
+    def increment(self, user_id):
         with self._lock:
-            self.connections[ip] += 1
+            self.active_sessions[user_id] += 1
     
-    def decrement(self, ip):
+    def decrement(self, user_id):
         with self._lock:
-            if self.connections[ip] > 0:
-                self.connections[ip] -= 1
+            if self.active_sessions[user_id] > 0:
+                self.active_sessions[user_id] -= 1
     
-    def get_count(self, ip):
+    def get_count(self, user_id):
         with self._lock:
-            return self.connections.get(ip, 0)
-
-class MessageBatcher:
-    def __init__(self, max_batch_size=5, max_wait_time=0.05):
-        self.max_size = max_batch_size
-        self.max_wait = max_wait_time
-        self.batches = defaultdict(list)
-        self.timers = {}
-        self.lock = threading.Lock()
-    
-    def add_message(self, room, message):
-        with self.lock:
-            self.batches[room].append(message)
-            
-            # Запускаем/сбрасываем таймер для этой комнаты
-            if room in self.timers:
-                self.timers[room].cancel()
-            
-            if len(self.batches[room]) >= self.max_size:
-                self.flush_room(room)
-            else:
-                self.timers[room] = threading.Timer(self.max_wait, self.flush_room, [room])
-                self.timers[room].start()
-    
-    def flush_room(self, room):
-        with self.lock:
-            if room in self.batches and self.batches[room]:
-                messages = self.batches[room][:]
-                self.batches[room] = []
-                
-                if messages:
-                    emit('message_batch', {
-                        'room': room,
-                        'messages': messages
-                    }, room=room, namespace='/')
-            
-            if room in self.timers:
-                del self.timers[room]
+            return self.active_sessions.get(user_id, 0)
 
 # Инициализация менеджеров
 rate_limiter = RateLimiter()
 connection_manager = ConnectionManager()
-message_batcher = MessageBatcher()
 ip_blacklist = set()
 suspicious_activity = defaultdict(list)
 
@@ -210,6 +155,7 @@ def init_db():
                 display_name TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_login TIMESTAMP,
+                last_activity TIMESTAMP,
                 is_active BOOLEAN DEFAULT 1,
                 is_online BOOLEAN DEFAULT 0
             )
@@ -417,6 +363,19 @@ def require_auth(f):
         if not user_data:
             return jsonify({'success': False, 'error': 'Invalid token'}), 401
         
+        # Обновляем время последней активности
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                'UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE id = ?',
+                [user_data['user_id']]
+            )
+            conn.commit()
+        except Exception as e:
+            app.logger.error(f"Error updating user activity: {e}")
+        finally:
+            return_db_connection(conn)
+        
         g.user_data = user_data
         return f(*args, **kwargs)
     return decorated_function
@@ -510,7 +469,7 @@ def root():
     
     return jsonify({
         'success': True,
-        'message': 'Optimized Text Messenger Server',
+        'message': 'Optimized Text Messenger Server (HTTP Only)',
         'status': 'running',
         'timestamp': datetime.datetime.utcnow().isoformat(),
         'version': '2.0'
@@ -598,7 +557,7 @@ def login():
     username = data.get('username', '').lower()
     password = data.get('password', '')
     
-    # Задержка для защиты от брутфорса (увеличена для безопасности)
+    # Задержка для защиты от брутфорса
     time.sleep(0.2)
     
     conn = get_db_connection()
@@ -609,9 +568,9 @@ def login():
         ).fetchone()
         
         if user and bcrypt.checkpw(password.encode('utf-8'), user['password'].encode('utf-8')):
-            # Обновляем время последнего входа и статус онлайн
+            # Обновляем время последнего входа, активности и статус онлайн
             conn.execute(
-                'UPDATE users SET last_login = CURRENT_TIMESTAMP, is_online = 1 WHERE id = ?',
+                'UPDATE users SET last_login = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP, is_online = 1 WHERE id = ?',
                 [user['id']]
             )
             conn.commit()
@@ -622,6 +581,9 @@ def login():
                 'username': user['username'],
                 'exp': datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
             }, app.config['SECRET_KEY'], algorithm='HS256')
+            
+            # Увеличиваем счетчик активных сессий
+            connection_manager.increment(user['id'])
             
             log_security_event(ip, 'LOGIN_SUCCESS', f'User logged in: {username}', user['id'])
             
@@ -646,6 +608,36 @@ def login():
     finally:
         return_db_connection(conn)
 
+@app.route('/logout', methods=['POST'])
+@require_auth
+def logout():
+    """Выход из системы"""
+    try:
+        user_id = g.user_data['user_id']
+        
+        # Обновляем статус пользователя
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                'UPDATE users SET is_online = 0 WHERE id = ?',
+                [user_id]
+            )
+            conn.commit()
+        finally:
+            return_db_connection(conn)
+        
+        # Уменьшаем счетчик активных сессий
+        connection_manager.decrement(user_id)
+        
+        log_security_event(request.remote_addr, 'LOGOUT', f'User logged out: {g.user_data["username"]}', user_id)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Logged out successfully'
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Logout failed'}), 500
+
 @app.route('/profile', methods=['GET'])
 @require_auth
 def get_profile():
@@ -653,7 +645,7 @@ def get_profile():
     conn = get_db_connection()
     try:
         user = conn.execute(
-            'SELECT id, username, display_name, created_at, last_login, is_online FROM users WHERE id = ?',
+            'SELECT id, username, display_name, created_at, last_login, last_activity, is_online FROM users WHERE id = ?',
             [g.user_data['user_id']]
         ).fetchone()
         
@@ -674,6 +666,7 @@ def get_profile():
                 'displayName': user['display_name'],
                 'createdAt': user['created_at'],
                 'lastLogin': user['last_login'],
+                'lastActivity': user['last_activity'],
                 'isOnline': bool(user['is_online']),
                 'stats': {
                     'messageCount': stats['message_count']
@@ -683,12 +676,12 @@ def get_profile():
     finally:
         return_db_connection(conn)
 
-# ========== КОМНАТЫ И СООБЩЕНИЯ ==========
+# ========== УЛУЧШЕННЫЕ КОМНАТЫ И СООБЩЕНИЯ ==========
 
 @app.route('/chat/rooms', methods=['GET'])
 @require_auth
 def get_chat_rooms():
-    """Получение списка комнат с кэшированием"""
+    """Получение списка комнат"""
     conn = get_db_connection()
     try:
         rooms = conn.execute('''
@@ -825,6 +818,85 @@ def get_room_messages(room):
     finally:
         return_db_connection(conn)
 
+@app.route('/chat/messages', methods=['POST'])
+@require_auth
+def send_message():
+    """Отправка нового сообщения"""
+    try:
+        user_id = g.user_data['user_id']
+        username = g.user_data['username']
+        ip = request.remote_addr
+        
+        # Многоуровневый rate limiting
+        if not multi_level_rate_limit(ip, user_id, 'send_message'):
+            return jsonify({'success': False, 'error': 'Message rate limit exceeded'}), 429
+        
+        data = request.get_json()
+        content = data.get('content', '').strip()
+        room = data.get('room', 'general')
+        
+        if not content:
+            return jsonify({'success': False, 'error': 'Message cannot be empty'}), 400
+        
+        # Безопасная обработка контента
+        sanitized_content = safe_message_content(content)
+        if not sanitized_content:
+            return jsonify({'success': False, 'error': 'Invalid message content'}), 400
+        
+        # Получаем display_name пользователя
+        conn = get_db_connection()
+        try:
+            user_record = conn.execute(
+                'SELECT display_name FROM users WHERE id = ?',
+                [user_id]
+            ).fetchone()
+            display_name = user_record['display_name'] if user_record else username
+            
+            # Сохраняем в базу данных
+            cursor = execute_with_retry(
+                '''INSERT INTO messages (user_id, username, display_name, room, content) 
+                   VALUES (?, ?, ?, ?, ?)''',
+                [user_id, username, display_name, room, sanitized_content]
+            )
+            
+            message_id = cursor.lastrowid
+            
+            # Получаем полные данные сообщения
+            new_message = conn.execute('''
+                SELECT m.*, u.display_name 
+                FROM messages m 
+                JOIN users u ON m.user_id = u.id 
+                WHERE m.id = ?
+            ''', [message_id]).fetchone()
+            
+            message_obj = {
+                'id': new_message['id'],
+                'user_id': new_message['user_id'],
+                'username': new_message['username'],
+                'display_name': new_message['display_name'],
+                'content': new_message['content'],
+                'room': new_message['room'],
+                'message_type': new_message['message_type'],
+                'timestamp': new_message['timestamp']
+            }
+            
+            app.logger.info(f"Message from {username} saved in room {room}")
+            
+            return jsonify({
+                'success': True,
+                'data': message_obj
+            })
+            
+        except Exception as e:
+            app.logger.error(f"Error saving message: {str(e)}")
+            return jsonify({'success': False, 'error': 'Failed to save message'}), 500
+        finally:
+            return_db_connection(conn)
+        
+    except Exception as e:
+        app.logger.error(f"Error in send_message: {str(e)}")
+        return jsonify({'success': False, 'error': 'Failed to send message'}), 500
+
 @app.route('/chat/search', methods=['GET'])
 @require_auth
 def search_messages():
@@ -886,321 +958,32 @@ def search_messages():
     finally:
         return_db_connection(conn)
 
-# ========== ОПТИМИЗИРОВАННЫЕ WEBSOCKET СОБЫТИЯ ==========
-
-connected_users = {}  # {socket_id: user_data}
-user_rooms = defaultdict(set)  # {user_id: set(room_names)}
-
-def send_system_message(room, content):
-    """Отправка системного сообщения"""
-    system_message = {
-        'id': f"system_{int(time.time())}",
-        'user_id': 0,
-        'username': 'system',
-        'display_name': 'System',
-        'content': content,
-        'room': room,
-        'message_type': 'system',
-        'timestamp': datetime.datetime.utcnow().isoformat()
-    }
-    
-    emit('new_message', system_message, room=room, namespace='/')
-
-@socketio.on('connect')
-def handle_connect():
-    """Оптимизированное подключение WebSocket"""
-    ip = request.remote_addr
-    
-    if ip in ip_blacklist:
-        app.logger.warning(f"Blocked connection from blacklisted IP: {ip}")
-        return False
-    
-    if connection_manager.get_count(ip) >= 5:
-        log_security_event(ip, 'CONNECTION_LIMIT', 'Too many WebSocket connections')
-        return False
-    
-    token = request.args.get('token')
-    if not token:
-        app.logger.warning(f"Missing token for connection from IP: {ip}")
-        return False
-    
-    user_data = verify_token(token)
-    if not user_data:
-        app.logger.warning(f"Invalid token for connection from IP: {ip}")
-        return False
-    
-    # Проверяем security limits
-    if not check_security_limits(ip, 'WS_CONNECT'):
-        return False
-    
-    # Обновляем статус пользователя в БД
+@app.route('/chat/users/online', methods=['GET'])
+@require_auth
+def get_online_users():
+    """Получение списка онлайн пользователей"""
     conn = get_db_connection()
     try:
-        conn.execute(
-            'UPDATE users SET is_online = 1 WHERE id = ?',
-            [user_data['user_id']]
-        )
-        conn.commit()
-    except Exception as e:
-        app.logger.error(f"Error updating user online status: {e}")
-    finally:
-        return_db_connection(conn)
-    
-    # Сохраняем данные пользователя
-    connected_users[request.sid] = user_data
-    connection_manager.increment(ip)
-    
-    # Присоединяем к общей комнате
-    join_room('general')
-    user_rooms[user_data['user_id']].add('general')
-    
-    app.logger.info(f"User {user_data['username']} connected from {ip}, sid: {request.sid}")
-    
-    # Отправляем статус подключения
-    emit('connection_status', {
-        'status': 'connected', 
-        'user': user_data['username'],
-        'timestamp': datetime.datetime.utcnow().isoformat()
-    })
-    
-    # Уведомляем других пользователей
-    send_system_message('general', f"User {user_data['username']} joined the chat")
-    
-    return True
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    """Оптимизированное отключение WebSocket"""
-    ip = request.remote_addr
-    user_data = connected_users.get(request.sid, {})
-    username = user_data.get('username', 'unknown')
-    user_id = user_data.get('user_id')
-    
-    # Удаляем из подключенных пользователей
-    if request.sid in connected_users:
-        del connected_users[request.sid]
-    
-    # Покидаем все комнаты
-    if user_id and user_id in user_rooms:
-        for room in user_rooms[user_id]:
-            leave_room(room)
-        del user_rooms[user_id]
-    
-    # Обновляем статус пользователя в БД
-    if user_id:
-        conn = get_db_connection()
-        try:
-            conn.execute(
-                'UPDATE users SET is_online = 0 WHERE id = ?',
-                [user_id]
-            )
-            conn.commit()
-        except Exception as e:
-            app.logger.error(f"Error updating user offline status: {e}")
-        finally:
-            return_db_connection(conn)
-    
-    connection_manager.decrement(ip)
-    app.logger.info(f"User {username} disconnected from {ip}")
-    
-    # Уведомляем других пользователей
-    if username != 'unknown':
-        send_system_message('general', f"User {username} left the chat")
-
-@socketio.on('join_room')
-def handle_join_room(data):
-    """Присоединение к комнате"""
-    user_data = connected_users.get(request.sid)
-    if not user_data:
-        emit('error', {'message': 'Authentication required'})
-        return
-    
-    room = data.get('room', 'general')
-    user_id = user_data['user_id']
-    username = user_data['username']
-    
-    # Покидаем предыдущую комнату (если нужно)
-    previous_room = data.get('previous_room')
-    if previous_room and previous_room in user_rooms[user_id]:
-        leave_room(previous_room)
-        user_rooms[user_id].discard(previous_room)
-    
-    # Присоединяем к новой комнате
-    join_room(room)
-    user_rooms[user_id].add(room)
-    
-    app.logger.info(f"User {username} joined room: {room}")
-    
-    # Уведомление о присоединении
-    send_system_message(room, f"User {username} joined the room")
-    
-    # Загружаем историю сообщений
-    conn = get_db_connection()
-    try:
-        messages = conn.execute('''
-            SELECT m.*, u.display_name 
-            FROM messages m 
-            JOIN users u ON m.user_id = u.id 
-            WHERE m.room = ? 
-            ORDER BY m.timestamp DESC 
-            LIMIT 50
-        ''', [room]).fetchall()
+        online_users = conn.execute('''
+            SELECT id, username, display_name, last_activity 
+            FROM users 
+            WHERE is_online = 1 AND is_active = 1
+            ORDER BY username
+        ''').fetchall()
         
-        messages_list = []
-        for msg in reversed(messages):
-            messages_list.append({
-                'id': msg['id'],
-                'user_id': msg['user_id'],
-                'username': msg['username'],
-                'display_name': msg['display_name'],
-                'content': msg['content'],
-                'message_type': msg['message_type'],
-                'reply_to': msg['reply_to'],
-                'edited': bool(msg['edited']),
-                'edited_at': msg['edited_at'],
-                'timestamp': msg['timestamp'],
-                'room': msg['room']
-            })
+        users_list = [{
+            'id': user['id'],
+            'username': user['username'],
+            'display_name': user['display_name'],
+            'last_activity': user['last_activity']
+        } for user in online_users]
         
-        emit('room_history', {
-            'room': room,
-            'messages': messages_list
+        return jsonify({
+            'success': True,
+            'data': users_list
         })
     finally:
         return_db_connection(conn)
-
-@socketio.on('send_message')
-def handle_send_message(data):
-    """Оптимизированная отправка сообщений с батчингом"""
-    try:
-        user_data = connected_users.get(request.sid)
-        if not user_data:
-            emit('error', {'message': 'Authentication required. Please reconnect.'})
-            return
-        
-        user_id = user_data['user_id']
-        username = user_data['username']
-        ip = request.remote_addr
-        
-        # Многоуровневый rate limiting
-        if not multi_level_rate_limit(ip, user_id, 'send_message'):
-            emit('error', {'message': 'Message rate limit exceeded. Please wait.'})
-            return
-        
-        content = data.get('content', '').strip()
-        room = data.get('room', 'general')
-        
-        if not content:
-            emit('error', {'message': 'Message cannot be empty'})
-            return
-        
-        # Безопасная обработка контента
-        sanitized_content = safe_message_content(content)
-        if not sanitized_content:
-            emit('error', {'message': 'Invalid message content'})
-            return
-        
-        # Получаем display_name пользователя
-        conn = get_db_connection()
-        try:
-            user_record = conn.execute(
-                'SELECT display_name FROM users WHERE id = ?',
-                [user_id]
-            ).fetchone()
-            display_name = user_record['display_name'] if user_record else username
-            
-            # Сохраняем в базу данных
-            cursor = execute_with_retry(
-                '''INSERT INTO messages (user_id, username, display_name, room, content) 
-                   VALUES (?, ?, ?, ?, ?)''',
-                [user_id, username, display_name, room, sanitized_content]
-            )
-            
-            message_id = cursor.lastrowid
-            
-            # Создаем объект сообщения для рассылки
-            message_obj = {
-                'id': message_id,
-                'user_id': user_id,
-                'username': username,
-                'display_name': display_name,
-                'content': sanitized_content,
-                'room': room,
-                'message_type': 'text',
-                'timestamp': datetime.datetime.utcnow().isoformat()
-            }
-            
-            # Добавляем в батчер для групповой отправки
-            message_batcher.add_message(room, message_obj)
-            
-            app.logger.info(f"Message from {username} saved and queued for room {room}")
-            
-        except Exception as e:
-            app.logger.error(f"Error saving message: {str(e)}")
-            emit('error', {'message': 'Failed to save message'})
-        finally:
-            return_db_connection(conn)
-        
-    except Exception as e:
-        app.logger.error(f"Error in send_message: {str(e)}")
-        emit('error', {'message': 'Failed to send message'})
-
-@socketio.on('typing')
-def handle_typing(data):
-    """Обработка индикации набора сообщения"""
-    user_data = connected_users.get(request.sid)
-    if not user_data:
-        return
-    
-    room = data.get('room', 'general')
-    username = user_data.get('username')
-    is_typing = data.get('is_typing', False)
-    
-    emit('user_typing', {
-        'username': username,
-        'is_typing': is_typing,
-        'room': room
-    }, room=room, include_self=False)
-
-@socketio.on('message_delivered')
-def handle_message_delivered(data):
-    """Подтверждение доставки сообщения"""
-    user_data = connected_users.get(request.sid)
-    if not user_data:
-        return
-    
-    message_id = data.get('message_id')
-    user_id = user_data['user_id']
-    
-    if message_id:
-        try:
-            execute_with_retry(
-                '''INSERT OR REPLACE INTO message_status (message_id, user_id, status) 
-                   VALUES (?, ?, 'delivered')''',
-                [message_id, user_id]
-            )
-        except Exception as e:
-            app.logger.error(f"Error updating message status: {e}")
-
-@socketio.on('message_read')
-def handle_message_read(data):
-    """Подтверждение прочтения сообщения"""
-    user_data = connected_users.get(request.sid)
-    if not user_data:
-        return
-    
-    message_id = data.get('message_id')
-    user_id = user_data['user_id']
-    
-    if message_id:
-        try:
-            execute_with_retry(
-                '''INSERT OR REPLACE INTO message_status (message_id, user_id, status) 
-                   VALUES (?, ?, 'read')''',
-                [message_id, user_id]
-            )
-        except Exception as e:
-            app.logger.error(f"Error updating message status: {e}")
 
 # ========== УЛУЧШЕННОЕ ЛОГИРОВАНИЕ ==========
 
@@ -1299,8 +1082,6 @@ def health_check():
         stats = {
             'timestamp': datetime.datetime.utcnow().isoformat(),
             'status': 'healthy',
-            'connected_users': len(connected_users),
-            'active_rooms': len(user_rooms),
             'db_connections': DB_POOL.qsize(),
             'memory_usage': f"{os.getpid()}",
             'uptime': int(time.time() - app_start_time)
@@ -1343,7 +1124,7 @@ def background_cleanup():
                 # Обновление статуса онлайн для неактивных пользователей
                 conn.execute('''
                     UPDATE users SET is_online = 0 
-                    WHERE last_login < datetime('now', '-1 hour') AND is_online = 1
+                    WHERE last_activity < datetime('now', '-5 minutes') AND is_online = 1
                 ''')
                 
                 conn.commit()
@@ -1394,38 +1175,34 @@ if __name__ == '__main__':
     cleanup_thread.start()
     
     print("=" * 60)
-    print("Optimized Text Messenger Server v2.0")
+    print("Optimized Text Messenger Server v2.0 (HTTP Only)")
     print("=" * 60)
     print("Features:")
     print("  ✅ Database connection pooling")
     print("  ✅ Multi-level rate limiting")
-    print("  ✅ Message batching for performance")
     print("  ✅ Enhanced security filters")
     print("  ✅ Full-text search (FTS5)")
     print("  ✅ Message status tracking")
     print("  ✅ Background cleanup tasks")
-    print("  ✅ WebSocket compression")
     print("  ✅ Cursor-based pagination")
     print("  ✅ Automatic DDoS protection")
-    print("  ✅ System messages")
+    print("  ✅ Online users tracking")
     print("=" * 60)
     
-    
+    # Получаем порт из переменной окружения (для Render) или используем 5000 по умолчанию
     port = int(os.environ.get('PORT', 5000))
     print(f"Starting server on port {port}")
     
-   
+    # SSL конфигурация (не нужно для Render - они сами обрабатывают HTTPS)
     ssl_context = None
     
     # Запуск сервера
     try:
-        socketio.run(
-            app, 
+        app.run(
             host='0.0.0.0', 
-            port=port,                
+            port=port,
             debug=False,
-            ssl_context=ssl_context,
-            allow_unsafe_werkzeug=False
+            ssl_context=ssl_context
         )
     except KeyboardInterrupt:
         print("\nServer stopped by user")
@@ -1440,6 +1217,4 @@ if __name__ == '__main__':
                 conn.close()
             except queue.Empty:
                 break
-
         print("Server shutdown complete")
-
