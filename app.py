@@ -3,9 +3,10 @@ from flask import Flask, request, jsonify, g
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_cors import CORS
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import psycopg2.pool
+import pg8000
+import pg8000.native
+from threading import Lock
+import os
 import bcrypt
 import jwt
 import datetime
@@ -717,3 +718,4 @@ if __name__ == '__main__':
     print(f"Starting server on port {port}")
     
     app.run(host='0.0.0.0', port=port, debug=False)
+
