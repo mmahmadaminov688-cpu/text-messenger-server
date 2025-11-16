@@ -1,6 +1,7 @@
 Flask==2.3.3
-Flask-Limiter==3.3.0
-Flask-CORS==4.0.0
+psycopg2-binary==2.9.7
+flask-limiter==3.3.0
+flask-cors==4.0.0
 bcrypt==4.0.1
 PyJWT==2.8.0
 tenacity==8.2.3
